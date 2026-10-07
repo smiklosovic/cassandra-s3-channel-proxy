@@ -1,0 +1,110 @@
+version: 2.1
+
+# The provider compiles against an unreleased cassandra-all, so every job that touches this project first has to
+# build that jar from a branch and install it into ~/.m2, where mavenLocal() can resolve it.
+parameters:
+  cassandra_repo:
+    type: string
+    default: https://github.com/smiklosovic/cassandra.git
+  cassandra_branch:
+    type: string
+    default: CEP-36-draft
+
+commands:
+  use_jdk11:
+    description: Cassandra trunk builds and runs on JDK 11 here; the images default to something newer.
+    steps:
+      - run:
+          name: Select JDK 11
+          command: |
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openjdk-11-jdk ant
+            sudo update-alternatives --set java /usr/lib/jvm/java-11-openjdk-amd64/bin/java
+            sudo update-alternatives --set javac /usr/lib/jvm/java-11-openjdk-amd64/bin/javac
+            echo 'export JAVA_HOME=/usr/lib/jvm/java-11-openjdk-amd64' >> "$BASH_ENV"
+
+  install_cassandra:
+    description: >
+      Clone the branch under test, build its jar, and install cassandra-all into ~/.m2. The checkout is kept at
+      ~/cassandra because the end-to-end tests launch its bin/cassandra, not just compile against its jar.
+    steps:
+      - run:
+          name: Clone Cassandra
+          command: git clone --depth 1 --branch << pipeline.parameters.cassandra_branch >> << pipeline.parameters.cassandra_repo >> ~/cassandra
+      - run:
+          name: Record the Cassandra revision for cache keys
+          command: git -C ~/cassandra rev-parse HEAD > ~/cassandra.sha
+      - restore_cache:
+          keys:
+            - cassandra-deps-v1-{{ checksum "~/cassandra.sha" }}
+            - cassandra-deps-v1-
+      - run:
+          name: Build and install cassandra-all
+          # mvn-install also builds the sources and javadoc jars. If that turns out to dominate the job, replace
+          # it with `ant jar` plus `mvn install:install-file` - this project declares the dependency with
+          # transitive = false, so a generated stub pom is all that is needed.
+          command: cd ~/cassandra && ant mvn-install
+      - save_cache:
+          key: cassandra-deps-v1-{{ checksum "~/cassandra.sha" }}
+          paths:
+            - ~/.m2/repository
+            - ~/cassandra/build/lib
+
+jobs:
+  # Hermetic: option parsing and the ByteBuffer transfer logic. No docker, no node.
+  unit:
+    docker:
+      - image: cimg/openjdk:11.0
+    steps:
+      - checkout
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq ant
+      - install_cassandra
+      - restore_cache:
+          keys:
+            - gradle-v1-{{ checksum "build.gradle" }}-{{ checksum "gradle.properties" }}
+            - gradle-v1-
+      - run: ./gradlew --no-daemon test
+      - save_cache:
+          key: gradle-v1-{{ checksum "build.gradle" }}-{{ checksum "gradle.properties" }}
+          paths:
+            - ~/.gradle/caches
+            - ~/.gradle/wrapper
+      - store_test_results:
+          path: build/test-results/test
+
+  # A machine executor, not docker + setup_remote_docker: the node runs in the job and reaches s3mock over a
+  # published port, which only resolves to localhost when the docker daemon is on the same host.
+  e2e:
+    machine:
+      image: ubuntu-2204:current
+    resource_class: large
+    steps:
+      - checkout
+      - use_jdk11
+      - install_cassandra
+      - restore_cache:
+          keys:
+            - gradle-v1-{{ checksum "build.gradle" }}-{{ checksum "gradle.properties" }}
+            - gradle-v1-
+      - run:
+          name: Pre-pull the S3 image
+          command: docker pull adobe/s3mock:4.3.0
+      - run:
+          name: End-to-end tests
+          no_output_timeout: 20m
+          command: ./gradlew --no-daemon e2eTest -PcassandraHome=$HOME/cassandra
+      - store_test_results:
+          path: build/test-results/e2eTest
+      - store_artifacts:
+          # The node's own logs and yaml, which is what any failure here actually needs.
+          path: build/e2e
+          destination: node-logs
+          when: on_fail
+
+workflows:
+  build_and_test:
+    jobs:
+      - unit
+      - e2e:
+          requires:
+            - unit

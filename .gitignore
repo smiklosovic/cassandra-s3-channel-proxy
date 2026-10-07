@@ -1,0 +1,6 @@
+build/
+.gradle/
+*.iml
+.idea/
+
+# the e2e node working directories live under build/

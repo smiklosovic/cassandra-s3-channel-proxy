@@ -1,0 +1,89 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'org.apache.cassandra'
+version = '0.1.0-SNAPSHOT'
+
+java {
+    // Cassandra's lowest supported JDK; the provider must load in the same JVM.
+    sourceCompatibility = JavaVersion.VERSION_11
+    targetCompatibility = JavaVersion.VERSION_11
+}
+
+repositories {
+    // cassandra-all 7.0-SNAPSHOT is unreleased: it is whatever `ant mvn-install` last put in
+    // ~/.m2 from a trunk checkout. mavenLocal() has to come first so that build wins.
+    mavenLocal()
+    mavenCentral()
+}
+
+dependencies {
+    // compileOnly is the whole point: ChannelProxyFactory, ChannelProxy and File come from the
+    // parent classloader at runtime (see PARENT_FIRST in PluginClassLoader). Bundling them would
+    // give the plugin its own incompatible copies of the very types that cross the boundary.
+    // transitive = false because only the SPI types are needed to compile. Dragging in
+    // Cassandra's ~100 transitive dependencies would put its Netty and Jackson on this
+    // project's compile classpath, which is exactly the clash the plugin classloader exists
+    // to prevent - and would hide it until runtime.
+    compileOnly("org.apache.cassandra:cassandra-all:${cassandraVersion}") { transitive = false }
+
+    // Bundled. Brings its own Netty, which is why this must never land on Cassandra's classpath.
+    implementation platform("software.amazon.awssdk:bom:${awsSdkVersion}")
+    implementation 'software.amazon.awssdk:s3'
+    implementation 'software.amazon.awssdk:netty-nio-client'
+
+    // compileOnly does not reach the test classpath, and a test touching this project's own classes needs the
+    // SPI types they extend to be resolvable. Still non-transitive, and still never shipped.
+    testCompileOnly("org.apache.cassandra:cassandra-all:${cassandraVersion}") { transitive = false }
+    testRuntimeOnly("org.apache.cassandra:cassandra-all:${cassandraVersion}") { transitive = false }
+
+    // The BOM is what gives junit-platform-launcher its version; the jupiter aggregate does not.
+    testImplementation platform("org.junit:junit-bom:${junitVersion}")
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+
+    // End-to-end only: a local S3 in docker, a real node, and a driver to drive it.
+    testImplementation "org.testcontainers:testcontainers:${testcontainersVersion}"
+    testImplementation "org.testcontainers:junit-jupiter:${testcontainersVersion}"
+    testImplementation "org.yaml:snakeyaml:${snakeyamlVersion}"
+    testImplementation "org.apache.cassandra:java-driver-core:${driverVersion}"
+}
+
+// The default test task stays hermetic: no docker, no node, no built Cassandra required.
+tasks.named('test') { useJUnitPlatform { excludeTags 'e2e' } }
+
+/**
+ * Starts adobe/s3mock in docker and a real 7.0-SNAPSHOT node pointed at it. Needs `ant jar` to have been run in
+ * the checkout named by cassandraHome, and a running docker daemon.
+ */
+tasks.register('e2eTest', Test) {
+    group = 'verification'
+    description = 'End-to-end tests against a real node and a local S3 in docker'
+
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform { includeTags 'e2e' }
+
+    // The node loads the provider from this directory, so it has to be the freshly built one.
+    dependsOn 'providerDist'
+
+    systemProperty 'cassandra.home', project.property('cassandraHome')
+    systemProperty 'provider.dir', layout.buildDirectory.dir('providers/s3').get().asFile.absolutePath
+
+    outputs.upToDateWhen { false }
+    testLogging { showStandardStreams = true; events 'passed', 'failed', 'skipped' }
+}
+
+/**
+ * The deployable artifact is a *directory*, not a jar: this project's jar plus every runtime
+ * dependency, to be dropped into $CASSANDRA_HOME/lib/providers/s3/. That path is deliberately not
+ * matched by cassandra.in.sh's `lib/*.jar` glob, so nothing here reaches the system classpath.
+ */
+tasks.register('providerDist', Sync) {
+    into layout.buildDirectory.dir('providers/s3')
+    from tasks.jar
+    from configurations.runtimeClasspath
+}
+
+tasks.named('build') { dependsOn 'providerDist' }
